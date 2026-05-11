@@ -16,12 +16,24 @@ export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayPr
   try {
     const { title, description, price, count } = JSON.parse(event.body ?? '{}');
 
-    // Validate all required fields are present and correct types
-    if (!title || !description || typeof price !== 'number' || typeof count !== 'number') {
+    // Validate all required fields are present, correct types, and valid values
+    if (
+      !title ||
+      typeof title !== 'string' ||
+      !description ||
+      typeof description !== 'string' ||
+      typeof price !== 'number' ||
+      price <= 0 ||
+      typeof count !== 'number' ||
+      count < 0 ||
+      !Number.isInteger(count)
+    ) {
       return {
         statusCode: 400,
         headers: CORS_HEADERS,
-        body: JSON.stringify({ message: 'Missing or invalid required fields: title, description, price (number), count (number)' }),
+        body: JSON.stringify({
+          message: 'Invalid product data. Required: title (string), description (string), price (positive number), count (non-negative integer)',
+        }),
       };
     }
 
