@@ -12,7 +12,8 @@
     "deploy": "cdk deploy",
     "destroy": "cdk destroy",
     "diff": "cdk diff",
-    "synth": "cdk synth"
+    "synth": "cdk synth",
+    "seed": "tsx scripts/seed-db.ts"
   },
   "devDependencies": {
     "@types/aws-lambda": "^8.10.161",
@@ -23,9 +24,12 @@
     "jest": "^30",
     "ts-jest": "^29",
     "ts-node": "^10.9.2",
+    "tsx": "^4.21.0",
     "typescript": "~5.9.3"
   },
   "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.1042.0",
+    "@aws-sdk/lib-dynamodb": "^3.1042.0",
     "aws-cdk-lib": "^2.248.0",
     "constructs": "^10.5.0"
   }
