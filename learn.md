@@ -218,3 +218,94 @@ Browser → API Gateway → Lambda → returns JSON response
 12. **What happens if an S3-triggered Lambda fails after partially processing a file? Will it retry?**
     - **Answer:** Yes — async Lambda invocations retry twice by default. This can cause duplicate processing. Make your handler idempotent (e.g., skip files already in `parsed/`).
 
+---
+
+## Real Debug Story: Signed URL Works but FE Upload Fails with CORS
+
+### What happened
+- `GET /import?name=sample-product.csv` returned a valid pre-signed URL.
+- FE upload still failed with browser CORS error.
+- Browser preflight (`OPTIONS`) to S3 URL returned `403`.
+
+### Why this happened
+- API Gateway/Lambda CORS and S3 bucket CORS are separate.
+- We had CORS on API Gateway response, but not on the S3 bucket for browser upload.
+- Browser upload flow for pre-signed URL is:
+  1. FE calls Import API to get signed URL.
+  2. FE sends `OPTIONS` preflight to S3 URL.
+  3. If preflight allows origin/method/headers, FE sends `PUT` file bytes.
+
+### What each piece means
+- Pre-signed URL: temporary permission token embedded in URL for S3 operations.
+- Preflight (`OPTIONS`): browser safety check before cross-origin `PUT`/custom headers.
+- `Access-Control-Allow-Origin`: which FE origins can call S3.
+- `Access-Control-Allow-Methods`: must include `PUT` for upload.
+- `Access-Control-Allow-Headers`: must include `content-type` (or `*`).
+- `x-id=PutObject` in URL: URL is meant for `PUT`; using `GET` is wrong for upload.
+
+### Real-dev debugging playbook
+1. Confirm signed URL API works:
+   - `GET /import?name=sample-product.csv` returns URL string.
+2. Check browser network tab:
+   - Look for failed `OPTIONS` or blocked `PUT`.
+3. Reproduce preflight from CLI:
+   - `OPTIONS` with `Origin`, `Access-Control-Request-Method: PUT`, `Access-Control-Request-Headers: content-type`.
+4. If preflight is `403`, inspect bucket CORS:
+   - `aws s3api get-bucket-cors --bucket <bucket>`.
+5. Apply correct bucket CORS and verify:
+   - `aws s3api put-bucket-cors ...`
+   - rerun preflight until `200` + required `Access-Control-*` headers.
+6. Validate upload method:
+   - FE must `PUT` file bytes to signed URL, not `GET` signed URL.
+7. Validate downstream processing:
+   - check S3 `uploaded/` and `parsed/`, then CloudWatch logs for parser Lambda.
+
+### Fix implemented
+- Added S3 bucket CORS for FE origins:
+  - `https://d210q4k0hjuddv.cloudfront.net`
+  - `http://localhost:3000`
+  - `http://localhost:5173`
+- Allowed methods: `GET`, `PUT`, `POST`, `HEAD`
+- Allowed headers: `*`
+- Verified preflight returns `200` with expected CORS headers.
+
+### Production checklist for this feature
+- API returns signed URL as plain string.
+- Signed URL expiration is short (for example 300 seconds).
+- FE uses `PUT` with `Content-Type: text/csv`.
+- Bucket CORS includes FE origin and `PUT`.
+- Parser Lambda has `GetObject + CopyObject + DeleteObject` permissions.
+- Parser moves file `uploaded/ -> parsed/` and logs each CSV row.
+
+### Questions and answers (practical)
+
+1. **Why do we need S3 CORS if API Gateway CORS already exists?**
+   - Because browser upload target is S3 origin, not API Gateway. Cross-origin rules are checked per target origin.
+
+2. **Why did signed URL generation succeed but upload fail?**
+   - URL signing is server-side and independent of browser CORS. Upload is browser cross-origin and was blocked by missing bucket CORS.
+
+3. **How do you quickly identify preflight failure?**
+   - In DevTools network: failed `OPTIONS` before `PUT`. Response usually lacks required `Access-Control-Allow-*` headers or returns `403`.
+
+4. **What is the most common FE bug in this flow?**
+   - Calling signed URL with `GET` instead of `PUT` (or forgetting `Content-Type` alignment).
+
+5. **Can we use `AllowedOrigins: ["*"]` in production?**
+   - Technically yes for many cases, but better to restrict to known FE domains for tighter security.
+
+6. **What does an expired signed URL look like?**
+   - S3 returns `403` with `RequestExpired` in response body.
+
+7. **How do you verify CORS fix outside browser?**
+   - Use CLI `OPTIONS` request with `Origin` and `Access-Control-Request-*` headers and check for `200` + `Access-Control-Allow-*`.
+
+8. **If preflight passes but PUT still fails, what next?**
+   - Check signed URL expiry, required headers mismatch, bucket policy/KMS restrictions, and exact HTTP method.
+
+9. **How do you make this robust in production?**
+   - Add FE retry with fresh signed URL, structured logging, CloudWatch alarms, and idempotent parser logic.
+
+10. **How would a senior dev close this incident?**
+   - Reproduce with evidence, isolate to CORS layer, implement minimal secure fix, verify via CLI + FE, and document runbook in `learn.md`.
+
