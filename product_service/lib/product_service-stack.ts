@@ -2,9 +2,13 @@ import * as cdk from 'aws-cdk-lib';
 import { Construct } from 'constructs';
 import * as apigateway from 'aws-cdk-lib/aws-apigateway';
 import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
+import * as sqs from 'aws-cdk-lib/aws-sqs';
+import * as sns from 'aws-cdk-lib/aws-sns';
+import * as subs from 'aws-cdk-lib/aws-sns-subscriptions';
 import * as path from 'path';
 import { NodejsFunction } from 'aws-cdk-lib/aws-lambda-nodejs';
 import { Runtime } from 'aws-cdk-lib/aws-lambda';
+import { SqsEventSource } from 'aws-cdk-lib/aws-lambda-event-sources';
 
 // Table names must match exactly what was created in the AWS Console (DynamoDB)
 const PRODUCTS_TABLE = 'products';
@@ -78,6 +82,68 @@ export class ProductServiceStack extends cdk.Stack {
     
     productsTable.grantWriteData(createProductLambda);  // createProduct → products
     stocksTable.grantWriteData(createProductLambda);    // createProduct → stocks
+
+    // ─── SQS Queue: catalogItemsQueue ─────────────────────────────────────────
+    const catalogItemsQueue = new sqs.Queue(this, 'CatalogItemsQueue', {
+      queueName: 'catalogItemsQueue',
+      // Dead-letter queue: after 5 failed processing attempts, message lands here
+      deadLetterQueue: {
+        maxReceiveCount: 5,
+        queue: new sqs.Queue(this, 'CatalogItemsDLQ', { queueName: 'catalogItemsDLQ' }),
+      },
+    });
+
+    // ─── SNS Topic: createProductTopic ────────────────────────────────────────
+    const createProductTopic = new sns.Topic(this, 'CreateProductTopic', {
+      topicName: 'createProductTopic',
+    });
+
+    // Email subscription — receives ALL messages (no filter)
+    createProductTopic.addSubscription(
+      new subs.EmailSubscription('nakul.nagariya1@gmail.com')
+    );
+
+    // Optional: second email subscription with a filter — only products with price >= 100
+    // Uses Gmail + alias so both land in the same inbox but CDK treats them as distinct subscriptions
+    createProductTopic.addSubscription(
+      new subs.EmailSubscription('nakul.nagariya1+highprice@gmail.com', {
+        filterPolicy: {
+          price: sns.SubscriptionFilter.numericFilter({ greaterThanOrEqualTo: 100 }),
+        },
+      })
+    );
+
+    // ─── Lambda: catalogBatchProcess ─────────────────────────────────────────
+    const catalogBatchProcessLambda = new NodejsFunction(this, 'CatalogBatchProcessFunction', {
+      runtime: Runtime.NODEJS_22_X,
+      handler: 'handler',
+      entry: path.join(__dirname, '../lambda/catalogBatchProcess/index.ts'),
+      environment: {
+        PRODUCTS_TABLE,
+        STOCKS_TABLE,
+        SNS_TOPIC_ARN: createProductTopic.topicArn,
+      },
+    });
+
+    productsTable.grantWriteData(catalogBatchProcessLambda);
+    stocksTable.grantWriteData(catalogBatchProcessLambda);
+    createProductTopic.grantPublish(catalogBatchProcessLambda);
+
+    // Trigger: SQS → catalogBatchProcess (up to 5 messages per invocation)
+    catalogBatchProcessLambda.addEventSource(
+      new SqsEventSource(catalogItemsQueue, { batchSize: 5 })
+    );
+
+    // Export queue URL and ARN so Import Service can reference it
+    new cdk.CfnOutput(this, 'CatalogItemsQueueUrl', {
+      value: catalogItemsQueue.queueUrl,
+      exportName: 'CatalogItemsQueueUrl',
+    });
+
+    new cdk.CfnOutput(this, 'CatalogItemsQueueArn', {
+      value: catalogItemsQueue.queueArn,
+      exportName: 'CatalogItemsQueueArn',
+    });
 
     // ─── API Gateway ──────────────────────────────────────────────────────────
     // RestApi creates an AWS API Gateway REST API.

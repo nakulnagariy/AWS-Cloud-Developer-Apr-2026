@@ -5,13 +5,16 @@ import {
   GetObjectCommand,
   S3Client,
 } from '@aws-sdk/client-s3';
+import { SQSClient, SendMessageCommand } from '@aws-sdk/client-sqs';
 import { Readable } from 'node:stream';
 import type { S3Event } from 'aws-lambda';
 
-// Set env var before module load
+// Set env vars before module load
 process.env.IMPORT_BUCKET_NAME = 'test-bucket';
+process.env.SQS_QUEUE_URL = 'https://sqs.ap-south-1.amazonaws.com/123456789012/catalogItemsQueue';
 
 const s3Mock = mockClient(S3Client);
+const sqsMock = mockClient(SQSClient);
 
 import {
   handler,
@@ -55,7 +58,10 @@ describe('moveFileToParsed', () => {
 describe('importFileParser handler', () => {
   beforeEach(() => {
     s3Mock.reset();
+    sqsMock.reset();
+    sqsMock.on(SendMessageCommand).resolves({ MessageId: 'test-id' });
     process.env.IMPORT_BUCKET_NAME = 'test-bucket';
+    process.env.SQS_QUEUE_URL = 'https://sqs.ap-south-1.amazonaws.com/123456789012/catalogItemsQueue';
   });
 
   afterEach(() => {
@@ -64,6 +70,7 @@ describe('importFileParser handler', () => {
 
   afterAll(() => {
     delete process.env.IMPORT_BUCKET_NAME;
+    delete process.env.SQS_QUEUE_URL;
   });
 
   it('parses CSV, logs records, and moves file to parsed/', async () => {

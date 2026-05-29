@@ -20,6 +20,7 @@
     "@types/jest": "^30",
     "@types/node": "^24.12.2",
     "aws-cdk": "2.1118.4",
+    "aws-sdk-client-mock": "^4.1.0",
     "esbuild": "^0.28.0",
     "jest": "^30",
     "ts-jest": "^29",
@@ -29,6 +30,7 @@
   },
   "dependencies": {
     "@aws-sdk/client-dynamodb": "^3.1042.0",
+    "@aws-sdk/client-sns": "^3.1054.0",
     "@aws-sdk/lib-dynamodb": "^3.1042.0",
     "aws-cdk-lib": "^2.248.0",
     "constructs": "^10.5.0"
