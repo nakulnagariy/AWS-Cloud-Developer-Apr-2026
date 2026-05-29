@@ -309,3 +309,191 @@ Browser → API Gateway → Lambda → returns JSON response
 10. **How would a senior dev close this incident?**
    - Reproduce with evidence, isolate to CORS layer, implement minimal secure fix, verify via CLI + FE, and document runbook in `learn.md`.
 
+---
+
+---
+
+# Task 6 — SQS & SNS: Async Microservices Communication
+
+## A. Key Learnings
+
+### SQS (Simple Queue Service)
+- **SQS** is a fully managed message queue — decouples producers (Import Service) from consumers (Product Service)
+- **Standard Queue** (used here): at-least-once delivery, best-effort ordering. **FIFO Queue**: exactly-once, strict order, lower throughput
+- **batchSize** on the Lambda event source controls how many SQS messages a single Lambda invocation receives (up to 10 for standard, 10 for FIFO)
+- Messages stay in the queue until they are successfully processed (deleted by the Lambda runtime after successful handler return)
+- If the Lambda throws, SQS **re-enqueues** the message for retry — add a **Dead Letter Queue (DLQ)** to capture poison messages after N retries
+- `SqsEventSource` from `aws-cdk-lib/aws-lambda-event-sources` wires the queue trigger in CDK
+
+### SNS (Simple Notification Service)
+- **SNS** is a fully managed pub/sub service — one publish, many subscribers
+- Subscribers can be: email, SQS, Lambda, HTTP/S endpoints, mobile push
+- **Email subscription** requires manual confirmation — subscriber clicks a link in a confirmation email before receiving messages
+- **Filter Policy** on a subscription lets you route messages selectively based on message attributes — subscribers only receive messages matching their filter
+
+### Async Pipeline Pattern
+- Synchronous: Client → Lambda → response (tight coupling, limited throughput)
+- Async: S3 → Lambda → SQS → Lambda → DynamoDB + SNS (loose coupling, scalable, resilient)
+- The Import Service and Product Service are **independent deployments** — they communicate only via the SQS queue URL
+- Cross-stack references: export queue ARN/URL from Product Service stack via `CfnOutput`, import into Import Service stack via `sqs.Queue.fromQueueArn()`
+
+### CDK Wiring for SQS & SNS
+- `new sqs.Queue(this, id, { queueName: 'catalogItemsQueue' })` — creates standard queue
+- `new sns.Topic(this, id, { topicName: 'createProductTopic' })` — creates topic
+- `topic.addSubscription(new subs.EmailSubscription('you@email.com'))` — adds email subscriber
+- `lambda.addEventSource(new SqsEventSource(queue, { batchSize: 5 }))` — wires SQS → Lambda
+- `queue.grantSendMessages(lambda)` — grants `sqs:SendMessage` to the Lambda role
+- `topic.grantPublish(lambda)` — grants `sns:Publish` to the Lambda role
+
+### SQS → Lambda Event Shape
+```typescript
+import { SQSEvent, SQSRecord } from 'aws-lambda';
+// Each record: record.body is the raw string sent by the producer
+// You must JSON.parse(record.body) to get the product data
+```
+
+### SNS Publish with Message Attributes (for Filter Policy)
+```typescript
+await snsClient.send(new PublishCommand({
+  TopicArn: process.env.SNS_TOPIC_ARN,
+  Message: JSON.stringify({ createdCount: N, products: [...] }),
+  MessageAttributes: {
+    price: { DataType: 'Number', StringValue: String(maxPrice) }
+  }
+}));
+```
+
+---
+
+## B. Standard / Conceptual Interview Questions
+
+1. **What is the difference between SQS and SNS?**
+   - **SQS** is a queue — messages wait until a consumer polls/reads them. Point-to-point. Guarantees delivery to one consumer.
+   - **SNS** is a topic — messages are pushed immediately to all subscribers (fan-out). One-to-many.
+
+2. **What is the difference between a Standard SQS queue and a FIFO queue?**
+   - Standard: at-least-once delivery, best-effort ordering, unlimited throughput.
+   - FIFO: exactly-once delivery, strict ordering, 300 TPS limit (3000 with batching).
+
+3. **What does `batchSize` control in an SQS Lambda event source?**
+   - The maximum number of SQS messages delivered to a single Lambda invocation. Here it's 5 — Lambda processes up to 5 CSV row messages per call.
+
+4. **What happens to an SQS message if the Lambda throws an error?**
+   - The message becomes visible again in the queue after the visibility timeout expires, and retries. After `maxReceiveCount` retries, it goes to the DLQ (if configured).
+
+5. **What is an SNS subscription filter policy?**
+   - A JSON policy on a subscription that filters which messages the subscriber receives, based on message attributes. Only messages matching the filter are delivered to that subscriber.
+
+6. **Why do you need to confirm an SNS email subscription before receiving messages?**
+   - AWS sends a confirmation email to prevent subscribing someone without their consent. Until confirmed, the endpoint receives nothing.
+
+7. **What is the typical architecture for "fan-out" in AWS?**
+   - SNS → multiple SQS queues. Each queue feeds a different Lambda or service. SNS delivers to all queues simultaneously; each queue processes independently.
+
+8. **What is the visibility timeout in SQS?**
+   - The period after a message is received by a consumer during which it is hidden from other consumers. If not deleted within that window, the message becomes visible again (implicit retry). Default: 30 seconds.
+
+9. **How do you pass the SQS queue URL from Product Service CDK to Import Service CDK without hardcoding?**
+   - Export via `CfnOutput` in Product Service stack. Import via `sqs.Queue.fromQueueArn()` in Import Service stack using the ARN as an environment variable or SSM Parameter Store value.
+
+10. **Why does `catalogBatchProcess` publish one SNS message per batch rather than one per product?**
+    - Fewer API calls, lower cost (SNS charges per publish), and the email is more readable as a batch summary.
+
+---
+
+## C. Tricky / Gotcha Questions
+
+1. **You add an SQS Lambda trigger with `batchSize: 5` but Lambda only ever receives 1 message at a time. Why?**
+   - `batchSize` is a *maximum*. If only 1 message is available in the queue when the poller fires, Lambda receives just 1. Messages must be queued up simultaneously to get a full batch.
+
+2. **SNS email subscription is confirmed but you never receive notifications. What do you check?**
+   - Verify `SNS_TOPIC_ARN` env var is correct in Lambda.
+   - Verify Lambda role has `sns:Publish` permission (via `topic.grantPublish(lambda)`).
+   - Check if a filter policy on the subscription is filtering out your messages.
+   - Check Lambda CloudWatch logs for SNS publish errors.
+
+3. **`importFileParser` sends to SQS but `catalogBatchProcess` receives empty product objects `{}`. Why?**
+   - `SendMessageCommand.MessageBody` must be `JSON.stringify(record)`. If you pass the raw csv-parser object without stringifying, SQS receives `[object Object]`, which `JSON.parse` fails on.
+
+4. **Your Lambda has `batchSize: 5` but the CSV only has 3 rows. How many Lambda invocations happen?**
+   - One invocation with 3 messages (the full batch available). `batchSize` is a ceiling, not a minimum.
+
+5. **You use `queue.grantSendMessages(importFileParser)` in Import Service stack but the queue lives in Product Service stack. CDK deploy fails with a permissions error. Why?**
+   - `grantSendMessages` adds an inline policy to the Lambda role in the same stack. This works cross-stack because IAM is global — but you need to import the queue using `Queue.fromQueueArn()` first. If the ARN is wrong or the stacks aren't deployed in order (Product Service first), the import fails.
+
+6. **Your SQS-triggered Lambda fails on every message but you have no DLQ. What happens to the messages?**
+   - They keep retrying until the `maxReceiveCount` is hit (default: configurable, often 3–5). After that, without a DLQ, they are **silently dropped** when `MessageRetentionPeriod` expires.
+
+7. **Why does your SNS email show the raw JSON string instead of human-readable text?**
+   - SNS email subscriptions deliver the raw `Message` string. If you `JSON.stringify` your payload, that's what lands in the email. Either send a human-readable plain-text string, or use a Lambda subscriber that formats the email via SES.
+
+8. **`PublishCommand` throws `AuthorizationError`. Lambda is in the same account. What's missing?**
+   - The Lambda execution role is missing `sns:Publish` permission on the topic. `topic.grantPublish(lambda)` in CDK adds this. Without it, the Lambda can't publish regardless of being in the same account.
+
+9. **You deploy Product Service, then Import Service. The Import Service Lambda can't find the queue ARN. Why?**
+   - CDK `CfnOutput` values are only visible in the CloudFormation console after deploy. If you're passing the ARN as a hardcoded string or env var, you must manually copy it after the Product Service deploy. Consider using SSM Parameter Store for zero-manual-copy cross-stack sharing.
+
+10. **Can two different SQS consumer Lambdas consume from the same standard queue simultaneously?**
+    - Yes, but they will receive **different** messages (standard queue hides a message once received). If you want both consumers to get the **same** messages, use SNS fan-out → two separate SQS queues.
+
+---
+
+## D. Real-World Scenario Questions
+
+1. **You're building a CSV import pipeline for 1 million rows per day. The Lambda times out at 15 minutes for large files. How do you redesign?**
+   - Split concerns: importFileParser streams rows and sends each row to SQS (already done here). catalogBatchProcess handles DynamoDB writes in batches. For even larger scale, use `BatchWriteItem` (up to 25 items per call) inside the Lambda. For extreme scale, use AWS Glue or EMR.
+
+2. **A junior dev says "let's just call the Product Service HTTP API from importFileParser instead of using SQS." What are the trade-offs?**
+   - Direct HTTP: simpler, but tightly coupled — if Product Service is down or slow, Import Service is blocked. Rate limits or throttling on API Gateway become bottlenecks.
+   - SQS: loose coupling, buffering (Import can keep sending even if Product is slow), natural retry semantics, batch processing. The right choice here.
+
+3. **Product managers want to know when a batch import fails halfway through. How do you implement observability?**
+   - Catch per-message errors in `catalogBatchProcess`, accumulate failures, publish an SNS message with error summary. Configure a DLQ on the SQS queue — failed messages land there. Set up a CloudWatch alarm on `ApproximateNumberOfMessagesNotVisible` for the DLQ > 0.
+
+4. **Security audit: the SQS queue URL is hardcoded in the Import Service Lambda env var. What's the risk and fix?**
+   - Low risk (queue URL isn't a secret), but it breaks if the queue is re-created with a new URL. Better: store queue URL in SSM Parameter Store and read at Lambda startup via `SSMClient`. Even simpler: use CDK cross-stack references so the URL is injected at deploy time and never hardcoded in source.
+
+5. **The `catalogBatchProcess` Lambda is writing products and then crashes before publishing to SNS. What's the observable outcome?**
+   - Products are in DynamoDB but no email notification was sent. The SQS batch was already processed (Lambda returned before crash) — so messages are deleted. This is a partial success. To prevent: use a try/catch and only acknowledge success if SNS publish also succeeds, or accept the rare missed notification as acceptable (notifications are non-critical here).
+
+---
+
+## E. AWS Certification Questions (SAA-C03 / DVA-C02 Level)
+
+1. **A company wants to decouple a file ingestion service from a data processing service so that processing can continue even if the ingestion service is temporarily overloaded. Which AWS service should they use?**
+   - **A) SNS B) SQS ✓ C) EventBridge D) Kinesis**
+   - SQS buffers messages and decouples producers from consumers.
+
+2. **An SQS-triggered Lambda fails repeatedly. After how many failures does the message get sent to the DLQ by default?**
+   - **Answer:** The DLQ is not automatic — you must configure `maxReceiveCount` on the queue's `RedrivePolicy`. There is no built-in default DLQ.
+
+3. **Which SQS queue type guarantees exactly-once message delivery?**
+   - **A) Standard B) FIFO ✓ C) Both D) Neither**
+
+4. **An SNS topic has three subscriptions: two SQS queues and one email. A message is published. How many times is the message delivered?**
+   - **Answer:** 3 times — once to each subscriber independently (fan-out).
+
+5. **What is the maximum number of SQS messages in a single Lambda batch trigger?**
+   - **Answer:** 10 for Standard queues, 10 for FIFO queues (with `batchSize` configurable up to 10 in the event source mapping; up to 10,000 with batch windows).
+
+6. **You publish a message to SNS with a message attribute `price = 1500`. Subscription A has no filter. Subscription B has filter `price >= 1000`. Which subscriptions receive the message?**
+   - **Answer:** Both A and B. Subscription A has no filter (receives all). Subscription B's filter matches (1500 >= 1000).
+
+7. **A Lambda is triggered by SQS and processes a batch of 10 messages. 3 messages fail and 7 succeed. What happens?**
+   - **Answer:** By default, the entire batch is retried (all 10 messages go back to the queue). Use **partial batch response** (`ReportBatchItemFailures`) to only re-enqueue the 3 failed messages.
+
+8. **What IAM permission does a Lambda need to send messages to an SQS queue?**
+   - **Answer:** `sqs:SendMessage` on the queue ARN. In CDK: `queue.grantSendMessages(lambda)`.
+
+9. **What is the maximum retention period for a message in an SQS queue?**
+   - **Answer:** 14 days.
+
+10. **Which AWS service would you use to route SNS messages to different processing pipelines based on the message content?**
+    - **Answer:** SNS **Filter Policy** on individual subscriptions routes based on message attributes. For complex routing, use **EventBridge** with rules.
+
+11. **An application needs to guarantee that messages from an SQS queue are processed in the order they were sent. Which queue type should you use?**
+    - **Answer:** FIFO queue with the same `MessageGroupId` for ordered processing.
+
+12. **What is the visibility timeout in SQS, and what happens if it expires before the Lambda finishes?**
+    - **Answer:** The period a message is hidden from other consumers after being received. If the Lambda doesn't delete the message before timeout expires, the message becomes visible again and is re-delivered — causing duplicate processing. Set visibility timeout > Lambda max execution time.
+
