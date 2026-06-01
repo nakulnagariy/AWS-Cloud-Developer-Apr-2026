@@ -93,6 +93,28 @@ export class ImportServiceStack extends cdk.Stack {
       authorizationType: apigateway.AuthorizationType.CUSTOM,
     });
 
+    // API Gateway authorizer error responses bypass Lambda CORS headers,
+    // so we must attach CORS headers directly to the gateway error responses.
+    api.addGatewayResponse('Unauthorized', {
+      type: apigateway.ResponseType.UNAUTHORIZED,
+      statusCode: '401',
+      responseHeaders: {
+        'Access-Control-Allow-Origin': "'*'",
+        'Access-Control-Allow-Headers': "'*'",
+        'Access-Control-Allow-Methods': "'*'",
+      },
+    });
+
+    api.addGatewayResponse('AccessDenied', {
+      type: apigateway.ResponseType.ACCESS_DENIED,
+      statusCode: '403',
+      responseHeaders: {
+        'Access-Control-Allow-Origin': "'*'",
+        'Access-Control-Allow-Headers': "'*'",
+        'Access-Control-Allow-Methods': "'*'",
+      },
+    });
+
     new cdk.CfnOutput(this, 'ImportServiceApiUrl', {
       value: api.url,
     });
