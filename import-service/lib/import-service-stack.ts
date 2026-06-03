@@ -4,6 +4,8 @@ import * as apigateway from 'aws-cdk-lib/aws-apigateway';
 import * as path from 'path';
 import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as sqs from 'aws-cdk-lib/aws-sqs';
+import * as lambda from 'aws-cdk-lib/aws-lambda';
+import * as ssm from 'aws-cdk-lib/aws-ssm';
 import { S3EventSource } from 'aws-cdk-lib/aws-lambda-event-sources';
 import { NodejsFunction } from 'aws-cdk-lib/aws-lambda-nodejs';
 import { Runtime } from 'aws-cdk-lib/aws-lambda';
@@ -63,10 +65,53 @@ export class ImportServiceStack extends cdk.Stack {
       },
     });
 
+    // Read the basicAuthorizer Lambda ARN from SSM (written by the Authorization Service stack)
+    const basicAuthorizerArn = ssm.StringParameter.valueForStringParameter(
+      this,
+      '/authorization-service/basicAuthorizerArn',
+    );
+
+    const basicAuthorizerFn = lambda.Function.fromFunctionArn(
+      this,
+      'BasicAuthorizerFunction',
+      basicAuthorizerArn,
+    );
+
+    const authorizer = new apigateway.TokenAuthorizer(this, 'BasicAuthorizer', {
+      handler: basicAuthorizerFn,
+      identitySource: apigateway.IdentitySource.header('Authorization'),
+      // Disable cache so every request is checked (useful during development/testing)
+      resultsCacheTtl: cdk.Duration.seconds(0),
+    });
+
     const importResource = api.root.addResource('import');
     importResource.addMethod('GET', new apigateway.LambdaIntegration(importProductsFile), {
       requestParameters: {
         'method.request.querystring.name': true,
+      },
+      authorizer,
+      authorizationType: apigateway.AuthorizationType.CUSTOM,
+    });
+
+    // API Gateway authorizer error responses bypass Lambda CORS headers,
+    // so we must attach CORS headers directly to the gateway error responses.
+    api.addGatewayResponse('Unauthorized', {
+      type: apigateway.ResponseType.UNAUTHORIZED,
+      statusCode: '401',
+      responseHeaders: {
+        'Access-Control-Allow-Origin': "'*'",
+        'Access-Control-Allow-Headers': "'*'",
+        'Access-Control-Allow-Methods': "'*'",
+      },
+    });
+
+    api.addGatewayResponse('AccessDenied', {
+      type: apigateway.ResponseType.ACCESS_DENIED,
+      statusCode: '403',
+      responseHeaders: {
+        'Access-Control-Allow-Origin': "'*'",
+        'Access-Control-Allow-Headers': "'*'",
+        'Access-Control-Allow-Methods': "'*'",
       },
     });
 
